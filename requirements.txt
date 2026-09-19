@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multiport
+openai
+python-jose
+stripe
+trimesh
+shapely
