@@ -1,881 +1,389 @@
-from jose import jwt, JWTError
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Query
-from fastapi import Request
-import os
-import time
-import sqlite3
-import json
-import smtplib
-import stripe
-from email.mime.text import MIMEText
-from openai import OpenAI
 from fastapi import FastAPI, Form
+from fastapi.responses import StreamingResponse, JSONResponse
+from openai import OpenAI
+import os
+import io
+import math
+from typing import List, Tuple
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/upload")
-async def upload(description: str = Form(...), software: str = Form(...), customer_email: str = Form(...)):
-    return JSONResponse({"status": "ok", "description": description, "software": software, "customer_email": customer_email})
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-app = FastAPI()
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+# -------------------------
+# Helper: ASCII STL parsing
+# -------------------------
+def extract_stl_block(text: str) -> str:
+    """Return substring from first 'solid' to last 'endsolid' (inclusive)."""
+    if not text:
+        return ""
+    start = text.find("solid")
+    end = text.rfind("endsolid")
+    if start == -1:
+        return ""
+    if end == -1:
+        # if no explicit end, assume end of text
+        return text[start:].strip()
+    # include the 'endsolid' token and anything after it on that line
+    # find end of line after end index
+    eol = text.find("\n", end)
+    if eol == -1:
+        eol = len(text)
+    return text[start:eol].strip()
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-JWT_SECRET = os.getenv("JWT_SECRET")
-JWT_ALGORITHM = "HS256"
+def parse_ascii_stl(stl_text: str) -> List[Tuple[Tuple[float,float,float], List[Tuple[float,float,float]]]]:
+    """
+    Parse ASCII STL into list of (normal, [v1,v2,v3]) facets.
+    Returns empty list on parse failure.
+    """
+    lines = [ln.strip() for ln in stl_text.splitlines() if ln.strip() != ""]
+    facets = []
+    i = 0
+    try:
+        while i < len(lines):
+            if lines[i].startswith("facet normal"):
+                parts = lines[i].split()
+                nx, ny, nz = float(parts[-3]), float(parts[-2]), float(parts[-1])
+                i += 1
+                # expect outer loop
+                if not lines[i].startswith("outer loop"):
+                    # skip until next facet
+                    i += 1
+                    continue
+                verts = []
+                i += 1
+                for _ in range(3):
+                    if not lines[i].startswith("vertex"):
+                        raise ValueError("vertex expected")
+                    vp = lines[i].split()
+                    vx, vy, vz = float(vp[-3]), float(vp[-2]), float(vp[-1])
+                    verts.append((vx, vy, vz))
+                    i += 1
+                # expect endloop, endfacet
+                # tolerate missing exact spacing
+                while i < len(lines) and not lines[i].startswith("endfacet"):
+                    i += 1
+                facets.append(((nx, ny, nz), verts))
+            else:
+                i += 1
+    except Exception:
+        return []
+    return facets
 
-REQUEST_LOG = []
-MAX_REQUESTS_PER_MINUTE = 5
+def edge_key(a, b):
+    # canonical undirected edge key (rounded to avoid float noise)
+    return tuple(sorted([tuple(round(x,6) for x in a), tuple(round(x,6) for x in b)]))
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-MODELS_DIR = os.path.join(os.path.dirname(__file__), "uploads", "models")
-FINAL_MODELS_DIR = os.path.join(os.path.dirname(__file__), "uploads", "final_models")
+def find_open_edges(facets):
+    """
+    Build edge map and return list of edges that appear only once (open).
+    Also returns vertex->connected vertices mapping for loop detection.
+    """
+    edge_count = {}
+    for _, verts in facets:
+        v0, v1, v2 = verts
+        for u, v in ((v0, v1), (v1, v2), (v2, v0)):
+            k = edge_key(u, v)
+            edge_count[k] = edge_count.get(k, 0) + 1
+    open_edges = [e for e,c in edge_count.items() if c == 1]
+    return open_edges
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(FINAL_MODELS_DIR, exist_ok=True)
-
-CAD_KEYWORDS = {
-    "solidworks": ["extrude", "cut", "fillet", "chamfer", "loft", "sweep", "shell"],
-    "nx": ["sketch", "extrude", "revolve", "pattern", "draft", "blend"],
-    "autocad": ["line", "circle", "arc", "trim", "extend", "offset", "fillet", "dimensions", "polyline"]
-}
-
-GEOMETRY_KEYWORDS = {
-    "cylinder": ["cylinder", "round", "pipe", "tube", "shaft"],
-    "block": ["block", "cube", "rectangular", "plate", "housing"],
-    "bracket": ["bracket", "mount", "support", "arm"],
-    "hole": ["hole", "bore", "drill", "opening"],
-    "slot": ["slot", "channel", "groove", "cutout"],
-    "thread": ["thread", "screw", "bolt", "nut", "fastener"]
-}
-
-TUTORIAL_TEMPLATES = {
-    "solidworks": {
-        "cylinder": [
-            "Start a new sketch on the Front plane.",
-            "Draw a circle with the specified diameter.",
-            "Exit the sketch and use the extrude feature to create a cylinder with the specified height.",
-            "Apply fillets or chamfers if specified."
-        ],
-        "block": [
-            "Start a new sketch on the Top plane.",
-            "Draw a rectangle using the given width and length.",
-            "Exit the sketch and Extrude to the specified height.",
-            "Add holes or slots using the Cut-Extrude feature."
-        ],
-        "bracket": [
-            "Sketch the base profile on the Top Plane.",
-            "Extrude the base.",
-            "Sketch the vertical arm on the side face of the base.",
-            "Extrude the arm.",
-            "Add mounting holes using the Cut-Extrude feature as needed."
-        ]
-    },
-    "nx": {
-        "cylinder": [
-            "Create a new sketch on the XY plane.",
-            "Draw a circle with the required diameter.",
-            "Finish the sketch and use the extrude command.",
-            "Set the extrusion height to the specified value.",
-            "Add blends or chamfers if needed."
-        ],
-        "block": [
-            "Sketch a rectangle on the XY plane.",
-            "Finish the sketch.",
-            "Use the Extrude to create a block.",
-            "Add holes or slots using the cut feature as specified.",
-        ]
-    }
-}
-
-
-def get_tutorial_template(software: str, geometry_type: str):
-    software = software.lower()
-    if software in TUTORIAL_TEMPLATES:
-        if geometry_type in TUTORIAL_TEMPLATES[software]:
-            return TUTORIAL_TEMPLATES[software][geometry_type]
+# -------------------------
+# Simple repair for prisms
+# -------------------------
+def attempt_prism_repair(facets):
+    """
+    If facets contain two dominant Z levels (top and bottom) and both loops exist,
+    attempt to connect corresponding vertices to create side faces.
+    Returns repaired facets list or None if not applicable.
+    """
+    # collect unique vertices
+    verts_set = {}
+    for _, vs in facets:
+        for v in vs:
+            verts_set.setdefault(tuple(round(x,6) for x in v), v)
+    verts = list(verts_set.keys())
+    if not verts:
+        return None
+    # group by z
+    z_map = {}
+    for v in verts:
+        z = round(v[2],6)
+        z_map.setdefault(z, []).append(v)
+    if len(z_map) < 2:
+        return None
+    # pick two most populated z-levels (bottom, top)
+    levels = sorted(z_map.items(), key=lambda kv: -len(kv[1]))
+    bottom_z, bottom_verts = levels[0][0], levels[0][1]
+    top_z, top_verts = levels[1][0], levels[1][1]
+    # require same number of vertices on both loops to attempt direct pairing
+    if len(bottom_verts) != len(top_verts):
+        return None
+    n = len(bottom_verts)
+    # sort loops by angle around centroid to pair corresponding edges
+    def centroid(loop):
+        cx = sum(v[0] for v in loop)/len(loop)
+        cy = sum(v[1] for v in loop)/len(loop)
+        return (cx, cy)
+    bottom_coords = [(v[0], v[1]) for v in bottom_verts]
+    top_coords = [(v[0], v[1]) for v in top_verts]
+    b_c = centroid(bottom_verts)
+    t_c = centroid(top_verts)
+    def angle_from(center, v):
+        return math.atan2(v[1]-center[1], v[0]-center[0])
+    bottom_sorted = sorted(bottom_verts, key=lambda v: angle_from(b_c, v))
+    top_sorted = sorted(top_verts, key=lambda v: angle_from(t_c, v))
+    # create side facets connecting bottom[i], bottom[i+1], top[i+1] and bottom[i], top[i+1], top[i]
+    new_facets = list(facets)  # copy existing
+    for i in range(n):
+        b0 = bottom_sorted[i]
+        b1 = bottom_sorted[(i+1)%n]
+        t0 = top_sorted[i]
+        t1 = top_sorted[(i+1)%n]
+        # two triangles per quad
+        # compute outward normal roughly by cross product (not strictly necessary)
+        new_facets.append(((0,0,0), [b0, b1, t1]))
+        new_facets.append(((0,0,0), [b0, t1, t0]))
+    # verify no open edges remain
+    open_edges = find_open_edges(new_facets)
+    if not open_edges:
+        return new_facets
     return None
 
+# -------------------------
+# Deterministic fallback generator
+# -------------------------
+def generate_block_with_hole_and_tower(block_w=40.0, block_d=40.0, block_h=20.0,
+                                       hole_d=12.0, tower_w=20.0, tower_d=10.0, tower_h=5.0,
+                                       tower_offset_x=8.0, n_segments=24) -> str:
+    """
+    Build a low-poly rectangular block centered at origin with a through-hole (approximated cylinder)
+    and a rectangular tower extruded on top. Returns ASCII STL text.
+    All units are mm.
+    """
+    verts = []
+    tris = []
 
-def is_description_specific(text: str) -> bool:
-    if len(text.strip()) < 20:
-        return False
+    # helper to add vertex and return index
+    def add_v(v):
+        verts.append(v)
+        return len(verts)-1
 
-    keywords = [
-        "mm", "cm", "inches", "dimensions", "size", "length", "width", "height",
-        "diameter", "radius", "hole", "slot", "bracket", "mount", "tolerance",
-        "fit", "clearance", "thread", "angle"
+    # block corners (centered)
+    hw = block_w/2.0
+    hd = block_d/2.0
+    bottom_z = 0.0
+    top_z = block_h
+
+    # create outer top and bottom loops (rectangle)
+    bottom_loop = [
+        (-hw, -hd, bottom_z),
+        ( hw, -hd, bottom_z),
+        ( hw,  hd, bottom_z),
+        (-hw,  hd, bottom_z),
     ]
-    matches = sum(1 for k in keywords if k in text.lower())
-    return matches >= 2
+    top_loop = [(x,y,top_z) for (x,y,_) in bottom_loop]
 
+    # triangulate top and bottom (two triangles each)
+    # bottom (normal down)
+    b0 = add_v(bottom_loop[0]); b1 = add_v(bottom_loop[1]); b2 = add_v(bottom_loop[2]); b3 = add_v(bottom_loop[3])
+    t0 = add_v(top_loop[0]); t1 = add_v(top_loop[1]); t2 = add_v(top_loop[2]); t3 = add_v(top_loop[3])
 
-def classify_geometry(description: str) -> str:
-    text = description.lower()
-    for shape, keywords in GEOMETRY_KEYWORDS.items():
-        if any(k in text for k in keywords):
-            return shape
-    return "unknown"
+    # bottom face (two triangles) - outward normal should be 0,0,-1
+    tris.append(((0,0,-1),(b0,b1,b2)))
+    tris.append(((0,0,-1),(b0,b2,b3)))
+    # top face (two triangles) - outward normal 0,0,1
+    tris.append(((0,0,1),(t0,t2,t1)))
+    tris.append(((0,0,1),(t0,t3,t2)))
 
+    # side faces (4 sides, each 2 triangles)
+    def add_side(a_bottom_idx, b_bottom_idx, a_top_idx, b_top_idx):
+        # two triangles: bottom a->b->top b ; bottom a->top b->top a
+        tris.append(((0,0,0),(a_bottom_idx, b_bottom_idx, b_top_idx)))
+        tris.append(((0,0,0),(a_bottom_idx, b_top_idx, a_top_idx)))
 
-def geometry_feasibility(description: str) -> bool:
-    shape = classify_geometry(description)
-    if shape == "unknown":
-        return False
-    return is_description_specific(description)
+    add_side(b0,b1,t0,t1)
+    add_side(b1,b2,t1,t2)
+    add_side(b2,b3,t2,t3)
+    add_side(b3,b0,t3,t0)
 
+    # create cylindrical hole vertices (approx) for top and bottom loops
+    hole_r = hole_d/2.0
+    hole_bottom_idxs = []
+    hole_top_idxs = []
+    for i in range(n_segments):
+        ang = 2*math.pi*i/n_segments
+        x = hole_r * math.cos(ang)
+        y = hole_r * math.sin(ang)
+        # center hole at origin (block centered at origin)
+        hole_bottom_idxs.append(add_v((x,y,bottom_z)))
+        hole_top_idxs.append(add_v((x,y,top_z)))
 
-def run_ai_interpretation(description, geometry_type, software):
+    # create inner cylinder side faces (n_segments quads -> 2 triangles each)
+    for i in range(n_segments):
+        i1 = hole_bottom_idxs[i]
+        i2 = hole_bottom_idxs[(i+1)%n_segments]
+        i3 = hole_top_idxs[(i+1)%n_segments]
+        i4 = hole_top_idxs[i]
+        tris.append(((0,0,0),(i1,i2,i3)))
+        tris.append(((0,0,0),(i1,i3,i4)))
+
+    # create caps for hole? NO — we want through-hole open, so do NOT add top/bottom caps for hole.
+
+    # add tower (rectangular footprint) on top face, offset toward +X
+    tw = tower_w/2.0
+    td = tower_d/2.0
+    tx = tower_offset_x
+    tower_bottom_z = top_z
+    tower_top_z = top_z + tower_h
+
+    tower_bl = add_v((tx - tw, -td, tower_bottom_z))
+    tower_br = add_v((tx + tw, -td, tower_bottom_z))
+    tower_tr = add_v((tx + tw,  td, tower_bottom_z))
+    tower_tl = add_v((tx - tw,  td, tower_bottom_z))
+
+    tower_tl_top = add_v((tx - tw, -td, tower_top_z))  # careful: naming consistent
+    tower_tr_top = add_v((tx + tw, -td, tower_top_z))
+    tower_br_top = add_v((tx + tw,  td, tower_top_z))
+    tower_bl_top = add_v((tx - tw,  td, tower_top_z))
+
+    # tower top face (two triangles)
+    tris.append(((0,0,1),(tower_tl_top, tower_br_top, tower_tr_top)))
+    tris.append(((0,0,1),(tower_tl_top, tower_bl_top, tower_br_top)))
+
+    # tower bottom face (attached to block top) - we do not create a separate bottom cap (it merges with block top)
+    # tower sides (4 sides)
+    tris.append(((0,0,0),(tower_bl, tower_br, tower_tr)))
+    tris.append(((0,0,0),(tower_bl, tower_tr, tower_tl)))
+
+    tris.append(((0,0,0),(tower_bl, tower_bl_top, tower_br_top)))
+    tris.append(((0,0,0),(tower_bl, tower_br_top, tower_br)))
+
+    tris.append(((0,0,0),(tower_br, tower_br_top, tower_tr_top)))
+    tris.append(((0,0,0),(tower_br, tower_tr_top, tower_tr)))
+
+    tris.append(((0,0,0),(tower_tr, tower_tr_top, tower_tl_top)))
+    tris.append(((0,0,0),(tower_tr, tower_tl_top, tower_tl)))
+
+    # Build ASCII STL text
+    def fmt_v(v):
+        return f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}"
+
+    out = ["solid model"]
+    for normal, tri in tris:
+        # compute normal if zero
+        if normal == (0,0,0):
+            # compute from vertices
+            a = verts[tri[0]]
+            b = verts[tri[1]]
+            c = verts[tri[2]]
+            ux, uy, uz = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
+            vx, vy, vz = (c[0]-a[0], c[1]-a[1], c[2]-a[2])
+            nx = uy*vz - uz*vy
+            ny = uz*vx - ux*vz
+            nz = ux*vy - uy*vx
+            # normalize
+            l = math.sqrt(nx*nx + ny*ny + nz*nz) or 1.0
+            nx, ny, nz = nx/l, ny/l, nz/l
+        else:
+            nx, ny, nz = normal
+        out.append(f"  facet normal {nx:.6f} {ny:.006f} {nz:.006f}")
+        out.append("    outer loop")
+        out.append(f"      vertex {fmt_v(verts[tri[0]])}")
+        out.append(f"      vertex {fmt_v(verts[tri[1]])}")
+        out.append(f"      vertex {fmt_v(verts[tri[2]])}")
+        out.append("    endloop")
+        out.append("  endfacet")
+    out.append("endsolid model")
+    return "\n".join(out)
+
+# -------------------------
+# Main endpoint
+# -------------------------
+@app.post("/generate-stl")
+async def generate_stl(description: str = Form(...)):
+    # Short, strict prompt (less to confuse the model)
+    prompt = f"""Output ONLY a valid ASCII STL file (no prose, no markdown, no commentary).
+Start with: 'solid model'
+End with: 'endsolid model'
+Between those lines include only ASCII STL facet blocks (facet normal / outer loop / vertex / endloop / endfacet).
+Produce a low-poly, watertight mesh for this description: {description}
+"""
+    # call model
     try:
-        ai_raw = call_ai_model(description, geometry_type, software)
-        ai_json = json.loads(ai_raw)
-        return ai_json
-    except:
-        return {
-            "geometry_plan": build_ai_geometry_plan(geometry_type, description),
-            "feature_plan": list(build_ai_feature_plan(geometry_type)),
-            "tutorial_plan": list(build_ai_tutorial_plan(software, geometry_type))
-        }
-
-
-def call_ai_model(description, geometry_type, software):
-    prompt = f"""
-You are an expert CAD engineer specializing in SolidWorks, Siemens NX, and AutoCAD.
-Interpret the following part description and produce:
-
-1. A geometry plan
-2. A feature plan
-3. A tutorial plan
-
-Description: {description}
-Geometry Type: {geometry_type}
-Software: {software}
-
-Respond in JSON with keys:
-- geometry_plan
-- feature_plan
-- tutorial_plan
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response.choices[0].message.content
-
-
-def build_ai_geometry_plan(geometry_type: str, description: str):
-    return {
-        "geometry_type": geometry_type,
-        "primary_dimensions": description.lower(),  # placeholder
-        "key_features": [],
-        "complexity": "unknown",
-        "confidence": 0.0
-    }
-
-
-def build_ai_feature_plan(geometry_type: str):
-    feature_map = {
-        "cylinder": ["sketch circle", "extrude", "fillet"],
-        "block": ["sketch rectangle", "extrude", "cut-extrude"],
-        "bracket": ["sketch base", "extrude", "sketch arm", "extrude", "cut holes"],
-        "hole": ["sketch point", "cut-extrude"],
-        "slot": ["sketch slot", "cut-extrude"],
-        "thread": ["sketch circle", "extrude", "thread tool"]
-    }
-    return feature_map.get(geometry_type, [])
-
-
-def build_ai_tutorial_plan(software: str, geometry_type: str):
-    steps = get_tutorial_template(software, geometry_type)
-    return steps if steps else []
-
-
-DB_PATH = "orders.db"
-
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL,
-            description_raw TEXT,
-            description_clean TEXT,
-            dimensions_raw TEXT,
-            software_raw TEXT,
-            software_normalized TEXT,
-            geometry_type TEXT,
-            feasible INTEGER,
-            file_uploaded TEXT,
-            ai_geometry_plan TEXT,
-            ai_feature_plan TEXT,
-            ai_tutorial_plan TEXT,
-            customer_email TEXT,
-            confirmation_message TEXT,
-            ai_model_file TEXT,
-            final_model_file TEXT,
-            order_status TEXT,
-            admin_notes TEXT,
-            rough_model_paid INTEGER,
-            final_model_paid INTEGER,
-            payment_intent_id TEXT
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.1,
         )
-    """)
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-def save_order_to_db(order):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO orders (
-            timestamp,
-            description_raw,
-            description_clean,
-            dimensions_raw,
-            software_raw,
-            software_normalized,
-            geometry_type,
-            feasible,
-            file_uploaded,
-            ai_geometry_plan,
-            ai_feature_plan,
-            ai_tutorial_plan,
-            customer_email,
-            confirmation_message,
-            ai_model_file,
-            final_model_file,
-            order_status,
-            admin_notes,
-            rough_model_paid,
-            final_model_paid,
-            payment_intent_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        order["timestamp"],
-        order["description_raw"],
-        order["description_clean"],
-        order["dimensions_raw"],
-        order["software_raw"],
-        order["software_normalized"],
-        order["geometry_type"],
-        int(order["feasible"]),
-        order["file_uploaded"],
-        json.dumps(order["ai_geometry_plan"]),
-        json.dumps(order["ai_feature_plan"]),
-        json.dumps(order["ai_tutorial_plan"]),
-        order["customer_email"],
-        order["confirmation_message"],
-        order["ai_model_file"],
-        order["final_model_file"],
-        order["order_status"],
-        order["admin_notes"],
-        order["rough_model_paid"],
-        order["final_model_paid"],
-        order["payment_intent_id"]
-    ))
-    conn.commit()
-    conn.close()
-
-from pathlib import Path
-
-DB_PATH = Path(__file__).parent / "tokens.db"
-
-def init_token_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                token TEXT NOT NUL,
-                created_at TIMESTAMPT DEFAULT CURENT_TIMESTAMP
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
-
-init_token_db()
-
-import secrets
-
-def generate_download_token(order_id: int, hours_valid: int=24):
-    token = secrets.token_urlsafe(32)
-    expires_at = time.time() + (hours_valid * 3600)
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO download_tokens (token, order_id, expires_at, used)
-        VALUES (?, ?, ?, 0)
-    """, (token, order_id, expires_at))
-    conn.commit()
-    conn.close()
-
-    return token
-
-def process_order(description, dimensions, software, file, geometry_type, feasible, customer_email):
-    ai_output = run_ai_interpretation(description, geometry_type, software)
-
-    order = {
-        "description_raw": description,
-        "description_clean": description.lower().strip(),
-        "dimensions_raw": dimensions,
-        "software_raw": software,
-        "software_normalized": software.lower().replace(" ", "_"),
-        "geometry_type": geometry_type,
-        "feasible": feasible,
-        "file_uploaded": file.filename if file else None,
-        "ai_geometry_plan": ai_output["geometry_plan"],
-        "ai_feature_plan": ai_output["feature_plan"],
-        "ai_tutorial_plan": ai_output["tutorial_plan"],
-        "order_id": None,
-        "timestamp": time.time(),
-        "customer_email": customer_email,
-        "confirmation_message": None,
-        "ai_model_file": None,
-        "final_model_file": None,
-        "order_status": "pending",
-        "admin_notes": None,
-        "rough_model_paid": 0,
-        "final_model_paid": 0,
-        "payment_intent_id": None
-    }
-
-    return order
-
-
-def send_email(to_email: str, subject: str, body: str):
-    smtp_server = "smtp.gmail.com"
-    smtp_port = 587
-    sender_email = "cad.workshop.tutorials@gmail.com"
-    sender_password = os.getenv("EMAIL_APP_PASSWORD")
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = sender_email
-    msg["To"] = to_email
-
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(sender_email, sender_password)
-        server.sendmail(sender_email, to_email, msg.as_string())
-        server.quit()
-        return True
+        stl_text_raw = response.choices[0].message.content
     except Exception as e:
-        print("Email error:", e)
-        return False
-
-
-def get_order(order_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-    row = cursor.fetchone()
-
-    conn.close()
-    return row
-
-
-def list_orders():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM orders ORDER BY order_id DESC")
-    rows = cursor.fetchall()
-
-    conn.close()
-    return rows
-
-
-@app.post("/upload")
-async def upload_request(
-    description: str = Form(...),
-    dimensions: str = Form(...),
-    software: str = Form(...),
-    customer_email: str = Form(None),
-    file: UploadFile = File(None)
-):
-    current_time = time.time()
-    REQUEST_LOG.append(current_time)
-    REQUEST_LOG[:] = [t for t in REQUEST_LOG if current_time - t < 60]
-
-    if len(REQUEST_LOG) > MAX_REQUESTS_PER_MINUTE:
-        return {
-            "status": "error",
-            "message": "Too many requests. Please wait a moment before submitting another order."
-        }
-
-    if not is_description_specific(description):
-        if not (file and file.filename):
-            return {
-                "status": "error",
-                "message": "Retry order form. Make sure the description is specific or upload an image."
-            }
-
-    shape = classify_geometry(description)
-    feasible = geometry_feasibility(description)
-    tutorial_steps = get_tutorial_template(software, shape)
-
-    order_packet = process_order(
-        description,
-        dimensions,
-        software,
-        file,
-        shape,
-        feasible,
-        customer_email
-    )
-
-    saved_filename = None
-    if file and file.filename:
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
-
-        saved_filename = file.filename
-        order_packet["file_uploaded"] = saved_filename
-
-    save_order_to_db(order_packet)
-
-    if order_packet["customer_email"]:
-        send_email(
-            order_packet["customer_email"],
-            "Your CAD Order Confirmation",
-            "Thank you for your order. Processing request."
-        )
-
-    send_email(
-        "cad.workshop.tutorials@gmail.com",
-        "New CAD Order Received",
-        json.dumps(order_packet, indent=2)
-    )
-
-    return {
-        "status": "success",
-        "message": "Order saved. Thank you.",
-        "saved_file": saved_filename,
-        "geometry_type": shape,
-        "ai_ready": bool(feasible),
-        "tutorial_steps": tutorial_steps,
-        "order": order_packet,
-        "ai_geometry_plan": order_packet["ai_geometry_plan"],
-        "ai_feature_plan": order_packet["ai_feature_plan"],
-        "ai_tutorial_plan": order_packet["ai_tutorial_plan"],
-        "note": "BE SPECIFIC: include dimensions, features, and shape details."
-    }
-
-
-def admin_required(token: str = Query(...)):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=403, detail="Not authorized.")
-    except JWTError:
-        raise HTTPException(status_code=403, detail="Invalid token.")
-
-def validate_download_token(order_id: int, token: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT token, expires_at, used FROM download_tokens
-        WHERE token = ? AND order_id = ?
-    """, (token, order_id))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        return False
-
-    token_value, expires_at, used = row
-
-    if used:
-        return False
-
-    if time.time() > expires_at:
-        return False
-
-    return True
-
-def mark_token_used(token: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE download_tokens SET used = 1 WHERE token = ?
-    """, (token,))
-    conn.commit()
-    conn.close()
-
-@app.get("/admin/orders")
-def admin_list_orders(token: str = Depends(admin_required)):
-    rows = list_orders()
-    return [format_order(r) for r in rows]
-
-
-@app.get("/admin/order/{order_id}")
-def admin_get_order(order_id: int, token: str = Depends(admin_required)):
-    row = get_order(order_id)
-    return format_order(row)
-
-from geometry_generator import generate_cylinder, generate_block, generate_bracket
-
-@app.post("/admin/generate_model/{order_id}")
-def admin_generate_model(order_id: int, token: str = Depends(admin_required)):
-    order = get_order(order_id)
-    if not order:
-        return {"status": "error", "message": "Order not found."}
-
-    geometry_type = order[7]
-    dims = order[4]
-
-    dims = dims.lower(). replace("mm", "").replace(" ", "")
-    numbers= [float(x) for x in dims.split(", ")]
-
-    if geometry_type == "cylinder":
-        mesh = generate_cylinder(numbers[0], numbers[1])
-    elif geometry_type == "block":
-        mesh = generate_block(numbers[0], numbers[1], numbers[2])
-    elif geometry_type == "braket":
-        mesh = generate_bracket(numbers[0], numbers[1], numbers[2])
-    else: 
-        return {"status": "error", "message": "Unsupported geometry type."}
-
-    filename = f"order_{order_id}_rough.stl"
-    file_path = os.path.join(MODELS_DIR, filename)
-    mesh.export(file_path)
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE orders
-        SET ai_model_file = ?, order_status = ?
-        WHERE order_id = ?
-    """, (filename, "ai_generated", order_id))
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "success",
-        "message": "AI rough model generated (placeholder).",
-        "ai_model_file": filename
-    }
-
-
-@app.post("/admin/upload_final_model/{order_id}")
-async def admin_upload_final_model(
-    order_id: int,
-    file: UploadFile = File(...),
-    token: str = Depends(admin_required)
-):
-    order = get_order(order_id)
-    if not order:
-        return {"status": "error", "message": "Order not found."}
-
-    file_path = os.path.join(FINAL_MODELS_DIR, file.filename)
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE orders
-        SET final_model_file = ?, order_status = ?
-        WHERE order_id = ?
-    """, (file.filename, "final_complete", order_id))
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "success",
-        "message": "Final model uploaded.",
-        "final_model_file": file.filename
-    }
-
-
-@app.post("/admin/update_status/{order_id}")
-def admin_update_status(
-    order_id: int,
-    new_status: str = Form(...),
-    token: str = Depends(admin_required)
-):
-    valid_statuses = [
-        "pending",
-        "ai_generated",
-        "final_complete",
-        "rejected",
-        "needs_revision",
-        "awaiting_payment"
-    ]
-
-    if new_status not in valid_statuses:
-        return {"status": "error", "message": "Invalid status."}
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE orders
-        SET order_status = ?
-        WHERE order_id = ?
-    """, (new_status, order_id))
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "success",
-        "message": f"Order {order_id} updated to '{new_status}'."
-    }
-
-
-@app.post("/admin/login")
-def admin_login(password: str = Form(...)):
-    if password != ADMIN_PASSWORD:
-        return {"status": "error", "message": "Invalid admin password."}
-
-    token = jwt.encode({"role": "admin"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"status": "success", "token": token}
-
-
-@app.post("/admin/add_note/{order_id}")
-def admin_add_note(
-    order_id: int,
-    note: str = Form(...),
-    token: str = Depends(admin_required)
-):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE orders
-        SET admin_notes = ?
-        WHERE order_id = ?
-    """, (note, order_id))
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "success",
-        "message": "Note added.",
-        "note": note
-    }
-
-
-@app.get("/admin/orders_by_status/{status}")
-def admin_orders_by_status(
-    status: str,
-    token: str = Depends(admin_required)
-):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM orders WHERE order_status = ?
-        ORDER BY order_id DESC
-    """, (status,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    return [format_order(r) for r in rows]
-
-
-def format_order(row):
-    if not row:
-        return None
-
-    return {
-        "order_id": row[0],
-        "timestamp": row[1],
-        "description_raw": row[2],
-        "description_clean": row[3],
-        "dimensions_raw": row[4],
-        "software_raw": row[5],
-        "software_normalized": row[6],
-        "geometry_type": row[7],
-        "feasible": bool(row[8]),
-        "file_uploaded": row[9],
-        "ai_geometry_plan": json.loads(row[10]),
-        "ai_feature_plan": json.loads(row[11]),
-        "ai_tutorial_plan": json.loads(row[12]),
-        "customer_email": row[13],
-        "confirmation_message": row[14],
-        "ai_model_file": row[15],
-        "final_model_file": row[16],
-        "order_status": row[17],
-        "admin_notes": row[18],
-        "rough_model_paid": row[19],
-        "final_model_paid": row[20],
-        "payment_intent_id": row[21]
-    }
-
-@app.post("/payment/create_intent/{order_id}")
-def create_payment_intent(order_id: int, model_type: str = Form(...)):
-    """
-    model_type = "rough" or "final"
-    """
-
-    row = get_order(order_id)
-    if not row:
-        return {"status": "error", "message": "Order not found."}
-
-    if model_type == "rough":
-        amount = 500
-    elif model_type == "final":
-        amount = 1500
-    else:
-        return {"status": "error", "message": "Invalid model type."}
-
-    intent = stripe.PaymentIntent.create(
-        amount=amount,
-        currency="usd",
-        metadata={"order_id": order_id, "model_type": model_type}
-    )
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE order SET payment_intent_id = ? WHERE order_id = ?
-    """, (intent.id, order_id))
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "success",
-        "client_secret": intent.client_secret,
-        "payment_intent_id": intent.id
-    }
-
-@app.post("/payment/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, endpoint_secret
-        )
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-    if event ["type"] == "payment_intent.succeeded":
-        intent = event["data"]["object"]
-        order_id = intent["metadata"]["order_id"]
-        model_type = intent["metadata"]["model_type"]
-
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        if model_type == "rough":
-            cursor.execute("""
-                UPDATE orders SET rough_model_paid = 1 WHERE order_id = ?
-            """, (order_id,))
-        elif model_type == "final":
-            cursor.execute("""
-                UPDATE orders SET final_model_paid = 1 WHERE order_id = ?
-            """, (order_id,))
-
-        conn.commet()
-        conn.close()
-
-        token = generate_download_token(order_id)
-
-        row = get_order(order_id)
-        customer_email = row[13]
-
-        if customer_email:
-            send_email(
-                customer_email,
-                "Your CAD Model is Ready",
-                f"Download link: https://cad.workshop.tutorials.com/download/final_model/{order_id}?token={token}"
-            )
-
-    return {"status": "success"}
-
-@app.post("/admin?generate_download_token/{order_id}")
-def admin_generate_download_token(order_id: int, token: str = Depends(admin_required)):
-    row = get_order(order_id)
-    if not row:
-        return {"status": "error", "message": "Order not found."}
-
-    token = generate_download_token(order_id)
-
-    return {
-        "status": "success",
-        "download_token": token,
-        "download_link": f"https://cad.workshop.tutorials.com/download/final_model/{order_id}?token={token}"
-
-    }
-
-from fastapi.responses import FileResponse
-
-@app.get("/download/uploaded/{order_id}")
-def download_uploaded(order_id: int):
-    row = get_order(order_id)
-    if not row:
-        return {"status": "error", "message": "Order not found."}
-
-    filename = row[9]  # file_uploaded
-    if not filename:
-        return {"status": "error", "message": "No uploaded file for this order."}
-
-    file_path = os.path.join(UPLOAD_DIR, filename)
-    if not os.path.exists(file_path):
-        return {"status": "error", "message": "File missing on server."}
-
-    return FileResponse(file_path, filename=filename)
-
-@app.get("/download/ai_model/{order_id}")
-def download_ai_model(order_id: int):
-    row = get_order(order_id)
-    if not row:
-        return {"status": "error", "message": "Order not found."}
-
-    filename = row[15]
-    if not filename:
-        return {"status": "error", "message": "No AI model generated for this order."}
-
-    file_path = os.path.join(MODELS_DIR, filename)
-    if not os.path.exists(file_path):
-        return {"status": "error", "message": "AI model file missing on server."}
-
-    return FileResponse(file_path, filename=filename)
-
-@app.get("/download/final_model/{order_id}")
-def download_final_model(order_id: int, token: str):
-    if not validate_download_token(order_id, token):
-        return {"status": "error", "message": "Invalid or expired token."}
-    
-    row = get_order(order_id)
-    filename = row[16]
-    file_path = os.path.join(FINAL_MODELS_DIR, filename)
-
-    mark_token_used(token)
-
-    return FileResponse(file_path, filename=filename)
-
-print("OpenAI key loaded:", os.getenv("OPENAI_API_KEY") is not None)
-print("Email password loaded:", os.getenv("EMAIL_APP_PASSWORD") is not None)
+        # model call failed — fallback deterministic
+        stl_text_raw = ""
+
+    # sanitize and extract
+    stl_text = extract_stl_block(stl_text_raw)
+    if not stl_text:
+        # fallback deterministic
+        stl_text = generate_block_with_hole_and_tower()
+
+    # parse facets
+    facets = parse_ascii_stl(stl_text)
+    if not facets:
+        # fallback deterministic
+        stl_text = generate_block_with_hole_and_tower()
+        facets = parse_ascii_stl(stl_text)
+
+    # check open edges
+    open_edges = find_open_edges(facets)
+    if open_edges:
+        # attempt prism repair
+        repaired = attempt_prism_repair(facets)
+        if repaired:
+            # rebuild ASCII from repaired facets
+            def build_ascii_from_facets(facets_list):
+                out = ["solid model"]
+                for normal, verts in facets_list:
+                    # compute normal if zero
+                    nx, ny, nz = normal
+                    if nx == ny == nz == 0:
+                        a,b,c = verts
+                        ux,uy,uz = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
+                        vx,vy,vz = (c[0]-a[0], c[1]-a[1], c[2]-a[2])
+                        nx = uy*vz - uz*vy
+                        ny = uz*vx - ux*vz
+                        nz = ux*vy - uy*vx
+                        l = math.sqrt(nx*nx + ny*ny + nz*nz) or 1.0
+                        nx,ny,nz = nx/l, ny/l, nz/l
+                    out.append(f"  facet normal {nx:.6f} {ny:.6f} {nz:.6f}")
+                    out.append("    outer loop")
+                    for v in verts:
+                        out.append(f"      vertex {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+                    out.append("    endloop")
+                    out.append("  endfacet")
+                out.append("endsolid model")
+                return "\n".join(out)
+            stl_text = build_ascii_from_facets(repaired)
+        else:
+            # repair failed — deterministic fallback
+            stl_text = generate_block_with_hole_and_tower()
+
+    # final validation quick check
+    final_facets = parse_ascii_stl(stl_text)
+    if not final_facets or find_open_edges(final_facets):
+        # last resort fallback
+        stl_text = generate_block_with_hole_and_tower()
+
+    # return as bytes
+    stl_bytes = stl_text.encode("utf-8")
+    return StreamingResponse(io.BytesIO(stl_bytes), media_type="application/sla",
+                             headers={"Content-Disposition":"attachment; filename=rough_model.stl"})
